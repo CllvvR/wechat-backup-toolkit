@@ -23,6 +23,7 @@ class ExportConfig:
     media_dir: Path | None
     media_limit: int
     overwrite: bool
+    allow_missing_media: bool = False
 
 
 def _iso_utc8(seconds: int) -> str:
@@ -92,6 +93,12 @@ def initialize_output(db: sqlite3.Connection) -> None:
           media_type INTEGER, identifier TEXT NOT NULL,
           PRIMARY KEY(message_id, ordinal)
         );
+        CREATE TABLE unresolved_message_media (
+          message_id INTEGER NOT NULL, ordinal INTEGER NOT NULL,
+          media_type INTEGER, identifier TEXT,
+          reason TEXT NOT NULL DEFAULT 'missing_from_backup_index',
+          PRIMARY KEY(message_id, ordinal)
+        );
         """
     )
 
@@ -113,6 +120,7 @@ def seed_output(
         "backup_key_stored": "false",
         "message_proto": "com.tencent.mm.protocal.protobuf.je/jd",
         "media_mode": config.media_mode,
+        "allow_missing_media": str(config.allow_missing_media).lower(),
     }
     db.executemany("INSERT INTO export_meta(key,value) VALUES (?,?)", sorted(metadata.items()))
     info = index.metadata
@@ -220,6 +228,8 @@ def export_text(
     text_path: Path,
     key: bytes,
     index: BackupIndex,
+    *,
+    allow_missing_media: bool = False,
 ) -> tuple[int, dict[int, set[int]]]:
     media_types: dict[int, set[int]] = {}
     message_id = 0
@@ -267,9 +277,19 @@ def export_text(
                 validate_message_media(message, f"message {message_id}")
                 for media_ordinal, identifier in enumerate(message.media_paths):
                     if identifier is None or identifier not in index.by_identifier:
-                        raise ValueError(
-                            f"message {message_id} references unknown media identifier {identifier!r}"
+                        if not allow_missing_media:
+                            raise ValueError(
+                                f"message {message_id} references unknown media identifier {identifier!r}"
+                            )
+                        # Preserve unresolved media references, with their original
+                        # identifiers and types, rather than inventing media rows.
+                        db.execute(
+                            "INSERT INTO unresolved_message_media "
+                            "(message_id,ordinal,media_type,identifier) VALUES (?,?,?,?)",
+                            (message_id, media_ordinal, message.media_types[media_ordinal],
+                             identifier),
                         )
+                        continue
                     media_id = index.by_identifier[identifier]
                     media_type = message.media_types[media_ordinal]
                     db.execute(
@@ -413,7 +433,20 @@ def convert_backup(
         db = _connect_output(partial)
         initialize_output(db)
         seed_output(db, index, paths, key_hash, config)
-        message_count, media_types = export_text(db, paths.text, key[:16], index)
+        message_count, media_types = export_text(
+            db, paths.text, key[:16], index,
+            allow_missing_media=config.allow_missing_media,
+        )
+        unresolved_count = db.execute(
+            "SELECT COUNT(*) FROM unresolved_message_media"
+        ).fetchone()[0]
+        db.executemany(
+            "INSERT OR REPLACE INTO export_meta VALUES (?,?)",
+            [
+                ("unresolved_media_refs", str(unresolved_count)),
+                ("backup_media_references_complete", str(unresolved_count == 0).lower()),
+            ],
+        )
         update_media_types(db, media_types)
         process_media(
             db,
@@ -433,7 +466,11 @@ def convert_backup(
         if backup:
             print(f"previous output backup: {backup}")
         print(f"output: {output}")
-        print(f"messages: {message_count}; media index: {len(index.media)}")
+        print(
+            f"messages: {message_count}; media index: {len(index.media)}; "
+            f"unresolved media references: {unresolved_count}; "
+            f"complete references: {unresolved_count == 0}"
+        )
         return output
     except BaseException:
         # Cleanup must also run for Ctrl+C and other non-Exception termination.

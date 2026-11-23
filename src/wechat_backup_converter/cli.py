@@ -58,6 +58,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="replace output after making a timestamped backup",
     )
+    convert.add_argument(
+        "--allow-missing-media",
+        action="store_true",
+        help="preserve unavailable attachment references separately; output is marked incomplete",
+    )
 
     verify = commands.add_parser(
         "verify", help="validate the complete backup without producing SQLite"
@@ -125,6 +130,7 @@ def run_convert(args: argparse.Namespace) -> Path:
             media_dir,
             args.media_limit,
             args.overwrite,
+            args.allow_missing_media,
         )
         return convert_backup(config, paths, decrypted_index, key, key_hash)
     finally:

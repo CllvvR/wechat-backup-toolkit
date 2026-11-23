@@ -110,6 +110,28 @@ Recognized files receive common extensions such as `.jpg`, `.png`, `.mp4`,
 documents as `.ole`, and unknown binary data as `.bin`. The converter does not
 transcode the plaintext.
 
+## Incomplete historical media references (explicit opt-in)
+
+Some real incremental backups contain messages that reference attachments no
+longer listed in `MsgMedia`, even when every indexed media object decrypts
+successfully. The default `verify` and `convert` commands reject those
+inconsistencies. Do **not** treat missing media as successfully recovered.
+
+To recover all available messages and indexed media without concealing missing
+attachments, add `--allow-missing-media` to **convert only**. The resulting
+SQLite file retains each message's original media paths and types, stores every
+unresolved reference with its message ID and ordinal in
+`unresolved_message_media`, and records the counts in `export_meta`:
+
+- `unresolved_media_refs`: exact number of unavailable references
+- `backup_media_references_complete`: `false` if any are missing
+- `allow_missing_media`: `true` when the opt-in was selected
+
+For example, append `--allow-missing-media` to the normal `convert` invocation.
+The produced SQLite database and extracted attachments contain sensitive
+plaintext; keep them in a private directory with restricted permissions.
+This is offline data recovery, **not** an iPhone WeChat restore.
+
 ## Verify a backup
 
 `verify` validates the encrypted input without producing a translated database:
@@ -153,6 +175,7 @@ Useful tables include:
 - `backup_info`, `conversations`, and `name_map`
 - `segments` and `messages`
 - `media`, `media_segments`, and `message_media`
+- `unresolved_message_media` (opt-in incomplete backups; missing references are preserved)
 - `message_type_counts` and `export_meta`
 
 The `messages` table contains interpreted fields such as message type, sender,
