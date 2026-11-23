@@ -198,12 +198,18 @@ def _load_media(
             raise ValueError(f"non-numeric media map key {item.map_key!r}") from exc
         if media_id not in media:
             raise ValueError(f"media segment {item.row_id} references unknown media {media_id}")
-        expected = expected_by_container.get(item.container, 0)
-        if item.offset != expected:
-            raise ValueError(f"{item.container}: expected offset {expected}, got {item.offset}")
+        previous_end = expected_by_container.get(item.container, 0)
+        # Real incremental backups may retain obsolete encrypted blocks
+        # between current indexed segments. Gaps are allowed, but referenced
+        # spans must be aligned, ordered, non-overlapping and end at EOF.
+        if item.offset < previous_end:
+            raise ValueError(
+                f"{item.container}: overlapping media segment offsets "
+                f"(prior end {previous_end}, next offset {item.offset})"
+            )
         if item.offset % 16 or item.inner_offset % 16 or item.length <= 0 or item.length % 16:
             raise ValueError(f"invalid AES alignment at media segment {item.row_id}")
-        expected_by_container[item.container] = expected + item.length
+        expected_by_container[item.container] = item.offset + item.length
         media[media_id].segments.append(item)
 
     for container, covered in expected_by_container.items():
