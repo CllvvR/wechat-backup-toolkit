@@ -32,8 +32,8 @@ the virtual environment, and command execution are managed by
 - Never stores the backup key in the output database.
 - Publishes SQLite output only after `PRAGMA integrity_check` succeeds.
 
-The SQLite export is intentionally one-way. It does not retain raw protobuf,
-unknown protocol fields, or opaque embedded message bytes for later reconstruction.
+The default SQLite export is intentionally one-way and does not retain raw protobuf.
+Opt in to source preservation as described below; neither mode implements native restore.
 
 ## Requirements
 
@@ -132,6 +132,31 @@ The produced SQLite database and extracted attachments contain sensitive
 plaintext; keep them in a private directory with restricted permissions.
 This is offline data recovery, **not** an iPhone WeChat restore.
 
+## Preserve original message records and source digests (explicit opt-in)
+
+Append `--preserve-source` to `convert` to retain each original decrypted message
+record as Base64 in `messages.raw_proto_base64`, including fields not translated
+into ordinary columns. This does not retain entire decrypted text segments or
+establish complete protocol semantics. The default schema remains unchanged.
+
+The export also records `raw_wire_preserved=true` and
+`source_media_sha256_json` (container name to SHA-256 of every available
+original encrypted media container). A single `BAK_0_MEDIA` additionally has
+`source_media_sha256` for legacy audit compatibility. Archive input extracts
+media containers for hashing even when `--media none` is selected. An empty
+mapping means no media containers were available; it is not proof of completeness.
+Hashing adds a sequential pass over available media. Ordinary source metadata
+changes during conversion cause rejection rather than publishing SQLite output.
+Use an explicitly selected, quiescent private source; this is not an atomic
+snapshot, independent source authentication, or cryptographic authentication of
+media. The explicit `--allow-missing-media` option remains independent.
+
+Raw message bytes can contain additional private information beyond displayed
+text. Keep the export private and do not commit it or publish it. The option
+cannot add trustworthy raw bytes or historical source hashes to an older export
+without converting the corresponding original files again. It does not grant
+access to a backup or permit a phone restore.
+
 ## Verify a backup
 
 `verify` validates the encrypted input without producing a translated database:
@@ -180,7 +205,8 @@ Useful tables include:
 
 The `messages` table contains interpreted fields such as message type, sender,
 recipient, content, timestamps, status, server identifiers, and media references.
-It does not contain raw protocol records or uninterpreted embedded binary data.
+By default it does not contain raw protocol records or uninterpreted embedded binary data.
+With `--preserve-source`, the optional Base64 column retains the original message record.
 
 The database is written to a unique temporary file beside the requested output.
 It is renamed into place only after SQLite integrity validation. Existing output

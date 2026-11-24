@@ -9,7 +9,7 @@ from pathlib import Path
 from . import __version__
 from .archive import discover_backup_files, prepare_input
 from .crypto import decrypt_sqlcipher3
-from .export import ExportConfig, convert_backup
+from .export import ExportConfig, _source_stamps, convert_backup
 from .verify import VerificationResult, verify_backup
 
 
@@ -64,6 +64,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="preserve unavailable attachment references separately; output is marked incomplete",
     )
 
+    convert.add_argument(
+        "--preserve-source", action="store_true",
+        help="retain original message bytes and SHA-256 of available encrypted media containers",
+    )
+
     verify = commands.add_parser(
         "verify", help="validate the complete backup without producing SQLite"
     )
@@ -103,11 +108,12 @@ def _decrypt_index(args: argparse.Namespace, include_media: bool):
     prepared.retained = args.keep_work
     try:
         paths = discover_backup_files(prepared.input_dir)
+        stamps = _source_stamps(paths) if getattr(args, "preserve_source", False) else None
         decrypted_index = prepared.work_dir / "Backup.decrypted.db"
         print("decrypting and authenticating Backup.db")
         pages = decrypt_sqlcipher3(paths.backup_db, decrypted_index, key)
         print(f"Backup.db: {pages} authenticated pages")
-        return key, key_hash, prepared, paths, decrypted_index
+        return key, key_hash, prepared, paths, decrypted_index, stamps
     except BaseException:
         if args.keep_work:
             print(f"work directory retained: {prepared.work_dir}")
@@ -119,7 +125,9 @@ def _decrypt_index(args: argparse.Namespace, include_media: bool):
 def run_convert(args: argparse.Namespace) -> Path:
     if args.media_limit < 1:
         raise ValueError("--media-limit must be positive")
-    key, key_hash, prepared, paths, decrypted_index = _decrypt_index(args, args.media != "none")
+    key, key_hash, prepared, paths, decrypted_index, stamps = _decrypt_index(
+        args, args.media != "none" or args.preserve_source
+    )
     try:
         media_dir = args.media_dir
         if media_dir is None and args.media in {"sample", "all"}:
@@ -131,8 +139,10 @@ def run_convert(args: argparse.Namespace) -> Path:
             args.media_limit,
             args.overwrite,
             args.allow_missing_media,
+            args.preserve_source,
         )
-        return convert_backup(config, paths, decrypted_index, key, key_hash)
+        return convert_backup(config, paths, decrypted_index, key, key_hash,
+                              expected_source_stamps=stamps)
     finally:
         if args.keep_work:
             print(f"work directory retained: {prepared.work_dir}")
@@ -141,7 +151,7 @@ def run_convert(args: argparse.Namespace) -> Path:
 
 
 def run_verify(args: argparse.Namespace) -> VerificationResult:
-    key, _, prepared, paths, decrypted_index = _decrypt_index(args, include_media=True)
+    key, _, prepared, paths, decrypted_index, _ = _decrypt_index(args, include_media=True)
     try:
         return verify_backup(paths, decrypted_index, key)
     finally:

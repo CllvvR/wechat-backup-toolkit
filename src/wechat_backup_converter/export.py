@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sqlite3
+import stat
 import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
@@ -24,6 +26,7 @@ class ExportConfig:
     media_limit: int
     overwrite: bool
     allow_missing_media: bool = False
+    preserve_source: bool = False
 
 
 def _iso_utc8(seconds: int) -> str:
@@ -40,7 +43,7 @@ def _connect_output(path: Path) -> sqlite3.Connection:
     return db
 
 
-def initialize_output(db: sqlite3.Connection) -> None:
+def initialize_output(db: sqlite3.Connection, *, preserve_source: bool = False) -> None:
     db.executescript(
         """
         CREATE TABLE export_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -102,6 +105,19 @@ def initialize_output(db: sqlite3.Connection) -> None:
         """
     )
 
+    if preserve_source:
+        db.execute("ALTER TABLE messages ADD COLUMN raw_proto_base64 TEXT NOT NULL DEFAULT ''")
+
+
+def _source_stamps(paths: BackupPaths):
+    stamps = {}
+    for path in (paths.backup_db, paths.text, *paths.media.values()):
+        st = path.lstat()
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError("source must be a regular file")
+        stamps[path] = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+    return stamps
+
 
 def seed_output(
     db: sqlite3.Connection,
@@ -122,6 +138,12 @@ def seed_output(
         "media_mode": config.media_mode,
         "allow_missing_media": str(config.allow_missing_media).lower(),
     }
+    if config.preserve_source:
+        digests = {name: sha256_file(path) for name, path in sorted(paths.media.items())}
+        metadata["source_media_sha256_json"] = json.dumps(digests, sort_keys=True, separators=(",", ":"))
+        if set(digests) == {"BAK_0_MEDIA"}:
+            metadata["source_media_sha256"] = digests["BAK_0_MEDIA"]
+        metadata["raw_wire_preserved"] = "true"
     db.executemany("INSERT INTO export_meta(key,value) VALUES (?,?)", sorted(metadata.items()))
     info = index.metadata
     db.execute(
@@ -230,6 +252,7 @@ def export_text(
     index: BackupIndex,
     *,
     allow_missing_media: bool = False,
+    preserve_source: bool = False,
 ) -> tuple[int, dict[int, set[int]]]:
     media_types: dict[int, set[int]] = {}
     message_id = 0
@@ -274,6 +297,9 @@ def export_text(
                         *_message_values(message),
                     ),
                 )
+                if preserve_source:
+                    db.execute("UPDATE messages SET raw_proto_base64=? WHERE id=?",
+                               (base64.b64encode(raw).decode("ascii"), message_id))
                 validate_message_media(message, f"message {message_id}")
                 for media_ordinal, identifier in enumerate(message.media_paths):
                     if identifier is None or identifier not in index.by_identifier:
@@ -409,6 +435,7 @@ def convert_backup(
     decrypted_index: Path,
     key: bytes,
     key_hash: str,
+    *, expected_source_stamps=None,
 ) -> Path:
     output = config.output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -423,6 +450,9 @@ def convert_backup(
     os.chmod(partial, 0o600)
     db: sqlite3.Connection | None = None
     try:
+        stamps = _source_stamps(paths) if config.preserve_source else None
+        if expected_source_stamps is not None and stamps != expected_source_stamps:
+            raise ValueError("source changed before export")
         index = load_index(decrypted_index, paths, config.media_mode != "none")
         print(
             f"backup: internal start={index.metadata.start_time} end={index.metadata.end_time}, device={index.metadata.manufacturer} {index.metadata.model} {index.metadata.platform} {index.metadata.platform_version}"
@@ -431,11 +461,12 @@ def convert_backup(
             f"index: {len(index.conversations)} conversations, {len(index.text_segments)} text segments, {len(index.media)} media objects"
         )
         db = _connect_output(partial)
-        initialize_output(db)
+        initialize_output(db, preserve_source=config.preserve_source)
         seed_output(db, index, paths, key_hash, config)
         message_count, media_types = export_text(
             db, paths.text, key[:16], index,
             allow_missing_media=config.allow_missing_media,
+            preserve_source=config.preserve_source,
         )
         unresolved_count = db.execute(
             "SELECT COUNT(*) FROM unresolved_message_media"
@@ -459,6 +490,8 @@ def convert_backup(
             media_types,
         )
         finalize_output(db)
+        if stamps is not None and _source_stamps(paths) != stamps:
+            raise ValueError("source changed during export")
         db.commit()
         db.close()
         db = None
